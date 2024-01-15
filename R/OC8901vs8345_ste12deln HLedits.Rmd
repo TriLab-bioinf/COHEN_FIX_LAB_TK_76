@@ -1,0 +1,384 @@
+---
+title: "Comparing OC8901 and OC8345 - ste12 only (Hernan Revision)"
+author: "Amanda Yeo, Hernan Lorenzi, Orna Cohen-Fix"
+date: "2023-11-16"
+output: html_document
+---
+
+````{r include=FALSE}
+knitr::opts_chunk$set(message = FALSE, 
+                      warning = FALSE,
+                      tidy.opts=list(width.cutoff=80),
+                      tidy=TRUE
+                      )
+```
+
+### Install required packages
+
+```{r}
+### Install required R libraries/packages:
+
+# CRAN repository:
+required_cran_packages <- c("cowplot","ggpubr","ggsci","RColorBrewer","pheatmap")
+new_cran_packages <- required_cran_packages[!(required_cran_packages %in%
+                                                installed.packages()[,"Package"])]
+if(length(new_cran_packages)>0) {install.packages(new_cran_packages)}
+
+# Bioconductor repository:
+required_bioconductor_packages <- c("DESeq2","org.Sc.sgd.db","EnhancedVolcano")
+
+new_bioconductor_packages <- required_bioconductor_packages[!(required_bioconductor_packages %in%
+                                                installed.packages()[,"Package"])]
+
+if(length(new_bioconductor_packages)>0) {
+  if (!require("BiocManager", quietly = TRUE)){
+    install.packages("BiocManager")
+  }
+  BiocManager::install(new_bioconductor_packages)
+}
+```
+
+### Load R libraries
+
+```{r}
+# Packages for differential expression analysis and plotting:
+
+suppressWarnings(
+  suppressPackageStartupMessages({
+    library(DESeq2);  # Package for differential expression analysis
+    library(cowplot); # Package for saving plots (ggsave2)
+    library(ggpubr); # Package for plotting functions
+    library(ggsci);
+    library(RColorBrewer); 
+    library(pheatmap); # Package for volcane plot functions
+    library(org.Sc.sgd.db); # Yeast annotations
+    library(EnhancedVolcano);
+    }
+  )
+)
+# Packages for functional analysis:
+
+#library(clusterProfiler)
+#library(enrichplot)
+#library(ggupset)
+#library(msigdbr)
+#library(ReactomePA)
+#library(ggraph)
+#library(BSgenome)
+```
+
+### Load useful functions
+
+```{r}
+#
+# --- function for adding gene names to DESeq2 result table ---
+#
+get_gene_names_from_gene_ids <- function(ensemble_ids, annotation_db, 
+                                         look_for = 'ENSEMBL', 
+                                         fetch = 'GENENAME'){
+  # Reference organism: Saccharomyces cerevisiae => DATABASE = org.Sc.sgd.db
+  symbols <- mapIds(annotation_db, keys = ensemble_ids, column = fetch, 
+                    keytype = look_for)
+  symbols <- symbols[!is.na(symbols)]
+  to_name <- ensemble_ids %in% names(symbols)
+  ensemble_ids[to_name] <- as.vector(symbols)
+  return(ensemble_ids)
+}
+#
+# --- function for PCA plots ---
+#
+plot_PCA = function(object, color_by="condition", 
+                    shape_by = 19, ntop=500, size = 3,
+                    returnData=FALSE, pcs = c(1,2))
+{
+  # Check variables are present in object
+  intgroup = c(color_by)
+  if (shape_by != 19){intgroup <- c(intgroup, shape_by)}
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+
+  # calculate the variance for each gene
+  rv <- rowVars(assay(object))
+
+  # select the ntop genes by variance
+  select <- order(rv, decreasing=TRUE)[seq_len(min(ntop, length(rv)))]
+
+  # perform a PCA on the data in assay(x) for the selected genes
+  pca <- prcomp(t(assay(object)[select,]))
+
+  # the contribution to the total variance for each component
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )
+
+  
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop=FALSE])
+  
+  # add the intgroup factors together to create a new grouping factor
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse=":"))
+  } else {
+    colData(object)[[intgroup]]
+  }
+
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pcs[1]], PC2=pca$x[,pcs[2]], group=group, intgroup.df, name=colnames(object))
+  colnames(d)[1] <- paste0("PC",pcs[1])
+  colnames(d)[2] <- paste0("PC",pcs[2])
+  
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[1:2]
+    return(d)
+  }
+  
+  ggplot(data=d, aes_string(x=colnames(d)[1], y=colnames(d)[2], color=color_by, shape=shape_by)) + 
+    geom_point(size=size) + 
+    scale_color_lancet() +
+    xlab(paste0("PC",pcs[1],": ",round(percentVar[pcs[1]] * 100),"% variance")) + # fixed
+    ylab(paste0("PC",pcs[2],": ",round(percentVar[pcs[2]] * 100),"% variance")) + # fixed
+    coord_fixed(ratio = (max(d[,1])-min(d[,1]))/(max(d[,2])-min(d[,2])))
+}
+
+#
+# --- function to plot gene expression of top10 genes ---
+#
+# Plot top10 diff expressed genes
+plot_expression_topN_genes <- function(deseq_result, N=10){
+  my_top10 <- head(rownames(deseq_result),N)
+  for (gene in my_top10){
+    print(gene)
+    plotCounts(dds, gene, 
+               intgroup = c("treatment","genotype"), 
+               returnData = FALSE, col=metadata$genotype)
+  }
+}
+```
+
+### Load data
+
+Hernan's code below: Basically the same as Amanda's but loads read counts and metadata for all samples and then split the tables into  genotype-specific input files.
+```{r}
+# Import read counts table into read_counts variable
+read_counts.all <- read.table(file = "../../read_counts_table_comp8901vs8345.txt",  
+                          header = TRUE, # First line contains column headers 
+                          row.names = 1, # Column 1 contains row names
+                          sep = "\t")   # Column delimiter is a tab (\t)
+
+# Round read counts to the closest integer
+read_counts.all <- round(read_counts.all, digits = 0)
+
+# Read metadata.all table
+metadata.all <- read.table(file = "../../metadata_OC8901vsOC8345.txt", 
+                       header = TRUE, 
+                       row.names = 1,
+                       sep = "\t")
+
+# Sort read_counts.all table so metadata.all and read_counts.all match order
+if(!unique(colnames(read_counts.all) == rownames(metadata.all))){
+  read_counts.all <- read_counts.all[, match(rownames(metadata.all), colnames(read_counts.all))]
+}
+
+# Include sample ids in metadata.all as a variable (column)
+metadata.all$sample_id <- c("AY31", "AY32" , "AY33" , "AY34" , "AY35" , "AY36" , "AY37" , "AY38" , "AY39" , "AY40" , "AY41" , "AY42", "AY1", "AY2", "AY3", "AY4","AY5", "AY6", "AY7", "AY8", "AY9", "AY10" , "AY11" , "AY12")
+
+# Include total read counts in metadata.all
+metadata.all$read_counts <- colSums(read_counts.all, na.rm = TRUE)
+
+# Make group, strain, treatment and genotype columns as factors
+metadata.all$treatment <- as.factor(metadata.all$treatment)
+metadata.all$strain <- as.factor(metadata.all$strain)
+metadata.all$genotype <- as.factor(metadata.all$genotype)
+metadata.all$experiment <- as.factor(metadata.all$experiment)
+
+# Keep only WT-specific data to match Amanda's code inputs
+keep <- metadata.all$genotype=="ste12"
+metadata <- metadata.all[keep,]
+read_counts <- read_counts.all[,keep]
+```
+
+Amanda's code:
+```{r}
+# # Import read counts table into read_counts variable
+# read_counts <- read.table(file = "read_counts_table_comp8901vs8345_ste12delonly.txt",  
+#                           header = TRUE, # First line contains column headers 
+#                           row.names = 1, # Column 1 contains row names
+#                           sep = "\t")   # Column delimiter is a tab (\t)
+# 
+# # Round read counts to the closest integer
+# read_counts <- round(read_counts, digits = 0)
+# 
+# # Read metadata table
+# metadata <- read.table(file = "metadata_OC8901vsOC8345_ste12delonly.txt", 
+#                        header = TRUE, 
+#                        row.names = 1,
+#                        sep = "\t")
+# 
+# # Sort read_counts table so metadata and read_counts match order
+# if(!unique(colnames(read_counts) == rownames(metadata))){
+#   read_counts <- read_counts[, match(rownames(metadata), colnames(read_counts))]
+# }
+# 
+# # Include sample ids in metadata as a variable (column)
+# metadata$sample_id <- c("AY35", "AY36" , "AY37" , "AY38" , "AY5", "AY6", "AY7", "AY8")
+# 
+# # Include total read counts in metadata
+# metadata$read_counts <- colSums(read_counts, na.rm = TRUE)
+# 
+# # Make group, strain, treatment and genotype columns as factors
+# metadata$treatment <- as.factor(metadata$treatment)
+# metadata$strain <- as.factor(metadata$strain)
+# metadata$genotype <- as.factor(metadata$genotype)
+# metadata$experiment <- as.factor(metadata$experiment)
+
+```
+
+### DE analysis with DESeq2
+
+```{r}
+# Create folder for storing plots
+dir.create(path = "./Plots_OC8901vsOC8345_ste12del", showWarnings = FALSE)
+
+# Add extra metadata column with treatment and genotype data combined
+metadata$treat_geno <-  paste(metadata$treatment, metadata$genotype, sep = '_')
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = read_counts,
+                              colData = metadata,
+                              design = ~ experiment + treat_geno) # Here we assume that all genotypes respond the same to treatment
+
+
+# Make sure reference groups are "none" and "wt". This means those categories will be the denominator when calculating Log2FC.
+dds$treatment <- relevel(dds$treatment, "none")
+#dds$genotype <- relevel(dds$genotype, "wt")
+dds$treat_geno <- relevel(dds$treat_geno, "none_ste12")
+dds <- DESeq(dds)
+```
+
+### Explortory analysis #1
+
+```{r}
+# Plot total reads per sample using barchar
+readcounts.p <- ggbarplot(data = metadata,
+                x = "sample_id",
+                y = "read_counts",
+                x.text.angle = 90,
+                fill = "treatment",
+                title = "Total read counts per sample",
+                ylab = "Read counts",
+                sort.by.groups = TRUE,
+                palette = c("red","orange"), #"jco",
+                sort.val = "asc") + xlab("Sample") + ylab("Read counts")
+ggsave2("Plots_OC8901vsOC8345_ste12del/barplot_read_counts_per_sample_AMANDA.pdf", plot = readcounts.p)
+
+print(readcounts.p)
+```
+**Figure 1:** Number of reads per sample
+
+### Preprocess data stored in DESeq2 object dds
+
+```{r}
+# 1. Normalize counts
+dds.vst <- vst(dds, blind=TRUE)
+
+# 2. Keep genes with at least 10 reads total across all samples
+keep <- rowSums(as.data.frame(dds.vst@assays@data@listData)) >= 10
+dds.vst <- dds.vst[keep,]
+
+# 3. Calculate distances between samples
+sampleDists <- dist(t(assay(dds.vst)))
+
+# 4. Plot inter-sample distances
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(rownames(sampleDistMatrix), dds.vst$treatment)
+
+#colnames(sampleDistMatrix) <- NULL
+hm.p <- pheatmap(mat = sampleDistMatrix,
+                clustering_distance_rows=sampleDists,
+                clustering_distance_cols=sampleDists,
+                labels_row = paste(metadata$treatment, 
+                                   metadata$genotype, sep = "-"),
+                labels_col = metadata$sample_id
+                )
+
+ggsave2(filename = "./Plots_OC8901vsOC8345_ste12del/heat_map_AMANDA.pdf", plot = hm.p)
+
+print(hm.p)
+
+```
+**Figure 2:** For wt and kar4 samples cluster by treatment separated for the rest of samples. Ste12 samples also cluster by treatment but their response seems to be different. This suggests that there is an interaction effect between genotype and treatment.
+
+### PCA
+
+```{r}
+# PCA
+principal_components <- c(1,2)
+pca.p <- plot_PCA(object = dds.vst, 
+                    ntop = 500,
+                    color_by = "treat_geno", 
+                    shape_by = "experiment",
+                    pcs = principal_components,
+                    returnData = FALSE)
+
+ggsave(paste0("Plots_OC8901vsOC8345_ste12del/pca_by_group_PC",principal_components[1],principal_components[2],"_AMANDA.pdf"), plot = pca.p)
+print(pca.p)
+```
+**Figure 3:** Samples group mainly by batch effect across experiments (PC1) and then by alpha factor treatment (PC2).
+
+
+### Print DESeq2 coefficients
+
+```{r}
+print(resultsNames(dds))
+```
+
+### Differential expression analysis -ste12∆:
+
+**1- The effect of treatment across all ste12∆ samples (the main effect) **
+
+*Note: For additional information about different ways of extracting results from a DESeq object see results() function help by typing ?results in the console,*
+
+```{r, warning=FALSE}
+# Create results directory where to store result tables
+dir.create("./Results_ste12del_OC8901vsOC8345", showWarnings = FALSE)
+
+DE_results_list <- list()
+
+coef <- c("treat_geno_alpha_factor_ste12_vs_none_ste12")
+
+# Set coef_id with the DESeq2 coefficient of interest
+coef_id <- "af_vs_none_ste12"
+
+# Get DESeq2 results. Note that when using coefficient names, you have to convert the coef vector to a list by doing list(c(coef))
+DE_results <- results(dds, contrast=list(c(coef)))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds, 
+                       contrast = list(c(coef)),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Add gene names to results table
+DE_results$gene_names <- get_gene_names_from_gene_ids(ensemble_ids = rownames(DE_results), annotation_db = org.Sc.sgd.db, look_for = "ENSEMBL", fetch = "GENENAME")
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=5)
+
+summary(dds)
+```
+
+### Save tables with results stored in the DE_results_list object
+
+```{r}
+for (example_name in names(DE_results_list)){
+  # Save results table into a file
+  write.table(x = as.data.frame(DE_results_list[[example_name]]), 
+            file = paste0("./Results_ste12del_OC8901vsOC8345/DE_",example_name,".txt"),
+            sep = "\t", 
+            col.names = NA)
+}
+```
